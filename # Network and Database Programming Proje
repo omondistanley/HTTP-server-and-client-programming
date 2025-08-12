@@ -1,0 +1,152 @@
+# Network and Database Programming Project
+
+## Overview
+
+This project demonstrates a simple HTTP server and client, as well as a backend database lookup server, all written in C. The system allows you to:
+
+- Serve static HTML and image files over HTTP.
+- Provide a dynamic lookup service via a web form, backed by a simple database file.
+- Test HTTP requests using a custom HTTP client.
+- Experiment with basic client-server and database programming concepts.
+
+The project is organized into three main directories:
+
+- `HTTP-server-and-client-programming/` — Contains the HTTP client implementation.
+- `network_programming/` — Contains the HTTP server implementation and static web content.
+- `searchdb/` — Contains the backend database server and database file.
+
+---
+
+## Directory Structure
+
+```
+HTTP-server-and-client-programming/
+    clientserv/
+        http-client         # Compiled HTTP client binary
+        http-client.c       # HTTP client source code
+        Makefile            # Build file for client
+        index.html          # Example HTML file
+        ...
+network_programming/
+    http-server             # Compiled HTTP server binary
+    http-server.c           # HTTP server source code
+    Makefile                # Build file for server
+    mdb-cs3157              # Database file (binary)
+    README.txt              # This README
+    html/
+        index.html          # Static HTML file
+        crew.jpg            # Example image
+        ship.jpg            # Example image
+searchdb/
+    mdb-lookup-server       # Compiled backend server binary
+    mdb-lookup-server.c     # Backend server source code
+    mdb-cs3157              # Database file (binary)
+    Makefile                # Build file for backend
+    mdb.c, mdb.h            # Database record definitions
+    ...
+```
+
+---
+
+## Components and How They Work
+
+### 1. **HTTP Server (`http-server`)**
+
+- Serves static files from the `html/` directory.
+- Handles HTTP GET requests.
+- For `/mdb-lookup` and `/mdb-lookup?key=...` URLs, acts as a proxy to the backend `mdb-lookup-server`:
+    - `/mdb-lookup` returns a web form.
+    - `/mdb-lookup?key=...` sends the key to the backend, receives matching records, and formats them as an HTML table.
+
+### 2. **HTTP Client (`http-client`)**
+
+- Sends HTTP GET requests to any HTTP server.
+- Saves the response to a file or prints it to stdout.
+- Useful for testing your HTTP server.
+
+### 3. **MDB Lookup Server (`mdb-lookup-server`)**
+
+- Reads the `mdb-cs3157` database file.
+- Listens for TCP connections.
+- For each line received (a search key), returns all matching records, ending with a blank line.
+
+### 4. **Database File (`mdb-cs3157`)**
+
+- A binary file containing fixed-size records.
+- Can be manipulated using custom add/delete utilities or by editing with provided tools.
+
+---
+
+## Build Instructions
+
+### **1. Build All Components**
+
+From the root, run:
+
+```sh
+cd searchdb
+make          
+
+cd ../network_programming
+make          
+
+cd ../HTTP-server-and-client-programming/clientserv
+make           
+```
+
+---
+
+## Running and Testing
+
+### **1. Start the Backend Database Server**
+
+```sh
+cd searchdb
+./mdb-lookup-server mdb-cs3157 9999
+```
+- This starts the backend on port 9999 using the `mdb-cs3157` database.
+
+### **2. Start the HTTP Server**
+
+```sh
+cd ../network_programming
+./http-server 8080 html localhost 9999
+```
+- Serves files from `html/` on port 8080 and connects to the backend on `localhost:9999`.
+
+### **3. Test Static Content**
+
+Open a browser or use curl:
+```
+ http://localhost:8080/index.html
+```
+- You should see the contents of `html/index.html`.
+
+### **4. Test Dynamic Content (MDB Lookup)**
+
+- In a browser, go to:  
+  `http://localhost:8080/mdb-lookup`
+- Submit a search term in the form.
+- Or, with curl:
+  ```sh
+  curl "http://localhost:8080/mdb-lookup?key=foo"
+  ```
+
+### **5. Test with the HTTP Client**
+
+```sh
+cd ../../HTTP-server-and-client-programming/clientserv
+./http-client localhost 8080 /index.html
+./http-client localhost 8080 "/mdb-lookup?key=foo"
+```
+- The responses should match what you see in your browser.
+
+---
+
+## Adding and Deleting Database Records
+
+- The `mdb-cs3157` file is a binary file of fixed-size records.
+
+
+---
+
