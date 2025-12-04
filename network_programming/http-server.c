@@ -242,6 +242,8 @@ static int reconnect_backend(struct BackendConnection *backend) {
         return -1;
     }
     
+    setvbuf(backend->fp, NULL, _IOLBF, 0);
+    
     return 0;
 }
 
@@ -446,16 +448,23 @@ int main(int argc, char **argv) {
 
             const char *form =
                 "<!DOCTYPE html>\n"
+                "<html><head><title>Database Search</title></head><body>\n"
                 "<h1>mdb-lookup</h1>\n"
                 "<p>\n"
                 "<form method=GET action=/mdb-lookup>\n"
-                "lookup: <input type=text name=key>\n"
+                "lookup: <input type=text name=key value=\"";
+            char header[4096];
+            char escaped_key[1024];
+            html_escape(decoded_key, escaped_key, sizeof(escaped_key));
+            snprintf(header, sizeof(header),
+                "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n\r\n%s%s\">\n"
                 "<input type=submit>\n"
                 "</form>\n"
-                "<p>\n";
-            char header[4096];
-            snprintf(header, sizeof(header),
-                "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n\r\n%s<table border>\n", form);
+                "<p>\n"
+                "<a href=\"/mdb-list\">List All Records</a> | <a href=\"/mdb-add\">Add New Record</a>\n"
+                "<p>\n"
+                "<table border=\"1\" cellpadding=\"5\" cellspacing=\"0\">\n"
+                "<tr><th>#</th><th>Record</th></tr>\n", form, escaped_key);
             send(clntsock, header, strlen(header), 0);
 
             if (backend_conn.fp == NULL || feof(backend_conn.fp) || ferror(backend_conn.fp)) {
@@ -489,16 +498,30 @@ int main(int argc, char **argv) {
             }
 
             clearerr(backend_conn.fp);
+            
+            usleep(100000);
 
             char line[1024];
             int row = 1;
             int found_any = 0;
+            int got_empty_line = 0;
+            
             while (fgets(line, sizeof(line), backend_conn.fp)) {
-                if (strcmp(line, "\n") == 0 || strcmp(line, "\r\n") == 0) break;
                 size_t llen = strlen(line);
-                if (llen > 0 && (line[llen-1] == '\n' || line[llen-1] == '\r')) line[--llen] = '\0';
-                char rowbuf[1200];
-                snprintf(rowbuf, sizeof(rowbuf), "<tr><td>%d</td><td>%s</td></tr>\n", row++, line);
+                
+                while (llen > 0 && (line[llen-1] == '\n' || line[llen-1] == '\r')) {
+                    line[--llen] = '\0';
+                }
+                
+                if (llen == 0) {
+                    got_empty_line = 1;
+                    break;
+                }
+                
+                char escaped_line[1200];
+                html_escape(line, escaped_line, sizeof(escaped_line));
+                char rowbuf[1400];
+                snprintf(rowbuf, sizeof(rowbuf), "<tr><td>%d</td><td>%s</td></tr>\n", row++, escaped_line);
                 if (send(clntsock, rowbuf, strlen(rowbuf), 0) < 0) {
                     fprintf(stderr, "Error sending to client\n");
                     break;
@@ -507,15 +530,28 @@ int main(int argc, char **argv) {
             }
             
             if (ferror(backend_conn.fp)) {
-                fprintf(stderr, "Error reading from backend\n");
+                fprintf(stderr, "Error reading from backend for search key: %s\n", decoded_key);
             }
             
             if (!found_any) {
-                char not_found_msg[] = "<tr><td colspan=2>ENTRY NOT FOUND</td></tr>\n";
-                send(clntsock, not_found_msg, strlen(not_found_msg), 0);
+                if (got_empty_line) {
+                    char not_found_msg[] = "<tr><td colspan=\"2\"><strong>ENTRY NOT FOUND</strong></td></tr>\n";
+                    send(clntsock, not_found_msg, strlen(not_found_msg), 0);
+                    fprintf(stderr, "Search for '%s' returned no matches\n", decoded_key);
+                } else if (feof(backend_conn.fp)) {
+                    char error_msg[] = "<tr><td colspan=\"2\">Error: Database connection closed</td></tr>\n";
+                    send(clntsock, error_msg, strlen(error_msg), 0);
+                    fprintf(stderr, "Backend connection closed during search for: %s\n", decoded_key);
+                } else {
+                    char error_msg[] = "<tr><td colspan=\"2\">Error: No response from database</td></tr>\n";
+                    send(clntsock, error_msg, strlen(error_msg), 0);
+                    fprintf(stderr, "No response received for search key: %s\n", decoded_key);
+                }
+            } else {
+                fprintf(stderr, "Search for '%s' returned %d result(s)\n", decoded_key, row - 1);
             }
             
-            send(clntsock, "</table>\n", 9, 0);
+            send(clntsock, "</table>\n</body></html>\n", 24, 0);
             snprintf(resp, sizeof(resp), "200 OK");
             fprintf(stdout, "%s \"%s %s %s\" %s\n", inet_ntoa(clntaddr.sin_addr),
                 method, requestURI, httpVersion, resp);
@@ -891,7 +927,6 @@ int main(int argc, char **argv) {
         struct stat st;
         if (stat(path, &st) == 0) {
             if (S_ISDIR(st.st_mode)) {
-                // If URI doesn't end with '/', send 403
                 if (requestURI[strlen(requestURI) - 1] != '/') {
                     char header[] = "HTTP/1.0 403 Forbidden\r\nContent-Type: text/html\r\n\r\n"
                                     "<!DOCTYPE html><html><body><h1>403 Forbidden</h1></body></html>\n";
@@ -926,8 +961,7 @@ int main(int argc, char **argv) {
                     continue;
                 }
             }
-            // Check file size limit (prevent serving huge files)
-            if (st.st_size > 100 * 1024 * 1024) {  // 100MB limit
+            if (st.st_size > 100 * 1024 * 1024) {
                 char header[] = "HTTP/1.0 413 Payload Too Large\r\nContent-Type: text/html\r\n\r\n"
                                 "<!DOCTYPE html><html><body><h1>413 Payload Too Large</h1></body></html>\n";
                 snprintf(resp, sizeof(resp), "413 Payload Too Large");

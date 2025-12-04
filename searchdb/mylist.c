@@ -1,7 +1,3 @@
-/*
- * mylist.c - Simple linked list implementation
- */
-
 #include "mylist.h"
 #include <stdlib.h>
 
@@ -17,11 +13,9 @@ struct Node *addAfter(struct List *list, struct Node *prevNode, void *data) {
     newNode->data = data;
     
     if (prevNode == NULL) {
-        // Add at the beginning
         newNode->next = list->head;
         list->head = newNode;
     } else {
-        // Add after prevNode
         newNode->next = prevNode->next;
         prevNode->next = newNode;
     }

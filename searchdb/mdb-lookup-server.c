@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <errno.h>
+#include <ctype.h>
 
 #define KeyMax 1000
 #define MAX_LINE_LEN 1000
@@ -17,35 +18,41 @@
 #define MAX_MSG_LEN 23
 int loadmdb(FILE *fp, struct List *dest)
 {
-    /*
-     * read all records into memory
-     */
     struct MdbRec r;
     struct Node *node = NULL;
     int count = 0;
     while (fread(&r, sizeof(r), 1, fp) == 1) {
-        // allocate memory for a new record and copy into it the one
-        // that was just read from the database.
         struct MdbRec *rec = (struct MdbRec *)malloc(sizeof(r));
         if (!rec)
             return -1;
         memcpy(rec, &r, sizeof(r));
-        // add the record to the linked list.
         node = addAfter(dest, node, rec);
         if (node == NULL)
             return -1;
         count++;
     }
-    // see if fread() produced error
     if (ferror(fp))
         return -1;
     return count;
 }
 void freemdb(struct List *list)
 {
-    // free all the records
     traverseList(list, &free);
     removeAllNodes(list);
+}
+
+static char *my_strcasestr(const char *haystack, const char *needle) {
+	if (!haystack || !needle) return NULL;
+	if (*needle == '\0') return (char *)haystack;
+	for (; *haystack; haystack++) {
+		const char *h = haystack;
+		const char *n = needle;
+		while (*h && *n && tolower((unsigned char)*h) == tolower((unsigned char)*n)) {
+			h++; n++;
+		}
+		if (!*n) return (char *)haystack;
+	}
+	return NULL;
 }
 
 static int save_database(const char *filename, struct List *list) {
@@ -201,7 +208,6 @@ int main( int argc, char **argv) {
 	if((server_socket = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
 		die("socket failed\n");
 	}
-	// Set SO_REUSEADDR to allow immediate rebinding after server restart
 	int reuse = 1;
 	if(setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
 		die("setsockopt failed\n");
@@ -268,20 +274,34 @@ int main( int argc, char **argv) {
 				char *key = line + 7;
 				struct Node *node = list.head;
 				int recNo = 1;
+				int match_count = 0;
+				
+				fprintf(stderr, "SEARCH command for key: '%s'\n", key);
+				
 				while (node) {
 					struct MdbRec *rec = (struct MdbRec *)node->data;
-					if (strstr(rec->name, key) || strstr(rec->msg, key)) {
+					if (my_strcasestr(rec->name, key) || my_strcasestr(rec->msg, key)) {
 						char response[MAX_RESPONSE_LEN];
 						int rlen = snprintf(response, sizeof(response), "%4d. {%s},said {%s}\n", 
 							recNo, rec->name, rec->msg);
 						if (rlen > 0 && rlen < (int)sizeof(response)) {
-							write(client_socket, response, rlen);
+							ssize_t written = write(client_socket, response, rlen);
+							if (written < 0) {
+								fprintf(stderr, "Error writing search result to client\n");
+								break;
+							}
+							match_count++;
 						}
 					}
 					node = node->next;
 					recNo++;
 				}
-				write(client_socket, "\n", 1);
+				
+				if (write(client_socket, "\n", 1) < 0) {
+					fprintf(stderr, "Error writing terminator to client\n");
+				}
+				
+				fprintf(stderr, "SEARCH for '%s' completed: %d match(es) found\n", key, match_count);
 			}
 			else if (strncmp(line, "ADD ", 4) == 0) {
 				char *data = line + 4;
@@ -362,20 +382,34 @@ int main( int argc, char **argv) {
 				char *key = line;
 				struct Node *node = list.head;
 				int recNo = 1;
+				int match_count = 0;
+				
+				fprintf(stderr, "Searching for key: '%s'\n", key);
+				
 				while (node) {
 					struct MdbRec *rec = (struct MdbRec *)node->data;
-					if (strstr(rec->name, key) || strstr(rec->msg, key)) {
+					if (my_strcasestr(rec->name, key) || my_strcasestr(rec->msg, key)) {
 						char response[MAX_RESPONSE_LEN];
 						int rlen = snprintf(response, sizeof(response), "%4d. {%s},said {%s}\n", 
 							recNo, rec->name, rec->msg);
 						if (rlen > 0 && rlen < (int)sizeof(response)) {
-							write(client_socket, response, rlen);
+							ssize_t written = write(client_socket, response, rlen);
+							if (written < 0) {
+								fprintf(stderr, "Error writing search result to client\n");
+								break;
+							}
+							match_count++;
 						}
 					}
 					node = node->next;
 					recNo++;
 				}
-				write(client_socket, "\n", 1);
+				
+				if (write(client_socket, "\n", 1) < 0) {
+					fprintf(stderr, "Error writing terminator to client\n");
+				}
+				
+				fprintf(stderr, "Search for '%s' completed: %d match(es) found\n", key, match_count);
 			}
 		}
 		if (ferror(database)) {
