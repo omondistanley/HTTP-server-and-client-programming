@@ -75,7 +75,7 @@ cd searchdb
 
 The server will display:
 ```
-Loaded X records from database
+Loaded records from database
 ```
 
 Keep this terminal open.

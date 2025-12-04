@@ -428,8 +428,8 @@ int main(int argc, char **argv) {
             fclose(fp); close(clntsock);
             continue;
         }
-        else if (is_get && strncmp(requestURI, "/mdb-lookup?key=", 16) == 0) {
-            char *encoded_key = requestURI + 16;
+        else if (is_get && requestURI_full && strncmp(requestURI_full, "/mdb-lookup?key=", 16) == 0) {
+            char *encoded_key = requestURI_full + 16;
             char decoded_key[1024];
             url_decode(encoded_key, decoded_key, sizeof(decoded_key));
             
@@ -488,8 +488,11 @@ int main(int argc, char **argv) {
                 fflush(backend_conn.fp);
             }
 
+            clearerr(backend_conn.fp);
+
             char line[1024];
             int row = 1;
+            int found_any = 0;
             while (fgets(line, sizeof(line), backend_conn.fp)) {
                 if (strcmp(line, "\n") == 0 || strcmp(line, "\r\n") == 0) break;
                 size_t llen = strlen(line);
@@ -500,10 +503,16 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "Error sending to client\n");
                     break;
                 }
+                found_any = 1;
             }
             
             if (ferror(backend_conn.fp)) {
                 fprintf(stderr, "Error reading from backend\n");
+            }
+            
+            if (!found_any) {
+                char not_found_msg[] = "<tr><td colspan=2>ENTRY NOT FOUND</td></tr>\n";
+                send(clntsock, not_found_msg, strlen(not_found_msg), 0);
             }
             
             send(clntsock, "</table>\n", 9, 0);
