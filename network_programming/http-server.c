@@ -242,7 +242,7 @@ static int reconnect_backend(struct BackendConnection *backend) {
         return -1;
     }
     
-    setvbuf(backend->fp, NULL, _IOLBF, 0);
+    setvbuf(backend->fp, NULL, _IONBF, 0);
     
     return 0;
 }
@@ -435,7 +435,20 @@ int main(int argc, char **argv) {
             char decoded_key[1024];
             url_decode(encoded_key, decoded_key, sizeof(decoded_key));
             
-            if (strlen(decoded_key) == 0 || strlen(decoded_key) > 1000) {
+            // Trim leading and trailing whitespace from search key
+            char *trimmed_key = decoded_key;
+            // Skip leading whitespace
+            while (*trimmed_key && isspace((unsigned char)*trimmed_key)) {
+                trimmed_key++;
+            }
+            // Trim trailing whitespace
+            char *end = trimmed_key + strlen(trimmed_key) - 1;
+            while (end > trimmed_key && isspace((unsigned char)*end)) {
+                *end = '\0';
+                end--;
+            }
+            
+            if (strlen(trimmed_key) == 0 || strlen(trimmed_key) > 1000) {
                 char header[] = "HTTP/1.0 400 Bad Request\r\nContent-Type: text/html\r\n\r\n"
                                 "<!DOCTYPE html><html><body><h1>400 Bad Request: Invalid key</h1></body></html>\n";
                 snprintf(resp, sizeof(resp), "400 Bad Request");
@@ -455,7 +468,7 @@ int main(int argc, char **argv) {
                 "lookup: <input type=text name=key value=\"";
             char header[4096];
             char escaped_key[1024];
-            html_escape(decoded_key, escaped_key, sizeof(escaped_key));
+            html_escape(trimmed_key, escaped_key, sizeof(escaped_key));
             snprintf(header, sizeof(header),
                 "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n\r\n%s%s\">\n"
                 "<input type=submit>\n"
@@ -481,7 +494,7 @@ int main(int argc, char **argv) {
                 }
             }
 
-            if (fprintf(backend_conn.fp, "%s\n", decoded_key) < 0 || fflush(backend_conn.fp) != 0) {
+            if (fprintf(backend_conn.fp, "%s\n", trimmed_key) < 0 || fflush(backend_conn.fp) != 0) {
                 fprintf(stderr, "Error writing to backend, reconnecting...\n");
                 if (reconnect_backend(&backend_conn) < 0) {
                     char error_msg[] = "<tr><td colspan=2>Error: Backend server unavailable</td></tr>\n";
@@ -493,19 +506,24 @@ int main(int argc, char **argv) {
                     fclose(fp); close(clntsock);
                     continue;
                 }
-                fprintf(backend_conn.fp, "%s\n", decoded_key);
+                fprintf(backend_conn.fp, "%s\n", trimmed_key);
                 fflush(backend_conn.fp);
             }
 
             clearerr(backend_conn.fp);
             
-            usleep(100000);
+            // Set receive timeout to prevent indefinite blocking
+            struct timeval timeout;
+            timeout.tv_sec = 2;
+            timeout.tv_usec = 0;
+            setsockopt(backend_conn.sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
             char line[1024];
             int row = 1;
             int found_any = 0;
             int got_empty_line = 0;
             
+            // Read response from backend
             while (fgets(line, sizeof(line), backend_conn.fp)) {
                 size_t llen = strlen(line);
                 
@@ -529,26 +547,31 @@ int main(int argc, char **argv) {
                 found_any = 1;
             }
             
+            // Reset timeout to default after reading
+            timeout.tv_sec = BACKEND_TIMEOUT_SEC;
+            timeout.tv_usec = 0;
+            setsockopt(backend_conn.sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+            
             if (ferror(backend_conn.fp)) {
-                fprintf(stderr, "Error reading from backend for search key: %s\n", decoded_key);
+                fprintf(stderr, "Error reading from backend for search key: %s\n", trimmed_key);
             }
             
             if (!found_any) {
                 if (got_empty_line) {
                     char not_found_msg[] = "<tr><td colspan=\"2\"><strong>ENTRY NOT FOUND</strong></td></tr>\n";
                     send(clntsock, not_found_msg, strlen(not_found_msg), 0);
-                    fprintf(stderr, "Search for '%s' returned no matches\n", decoded_key);
+                    fprintf(stderr, "Search for '%s' returned no matches\n", trimmed_key);
                 } else if (feof(backend_conn.fp)) {
                     char error_msg[] = "<tr><td colspan=\"2\">Error: Database connection closed</td></tr>\n";
                     send(clntsock, error_msg, strlen(error_msg), 0);
-                    fprintf(stderr, "Backend connection closed during search for: %s\n", decoded_key);
+                    fprintf(stderr, "Backend connection closed during search for: %s\n", trimmed_key);
                 } else {
                     char error_msg[] = "<tr><td colspan=\"2\">Error: No response from database</td></tr>\n";
                     send(clntsock, error_msg, strlen(error_msg), 0);
-                    fprintf(stderr, "No response received for search key: %s\n", decoded_key);
+                    fprintf(stderr, "No response received for search key: %s\n", trimmed_key);
                 }
             } else {
-                fprintf(stderr, "Search for '%s' returned %d result(s)\n", decoded_key, row - 1);
+                fprintf(stderr, "Search for '%s' returned %d result(s)\n", trimmed_key, row - 1);
             }
             
             send(clntsock, "</table>\n</body></html>\n", 24, 0);
