@@ -18,6 +18,7 @@ Database Lookup Server (port 9999)
 
 ### 1. HTTP Server (`network_programming/http-server`)
 - Serves static HTML, images, and other files
+- Confines static reads to regular files beneath the configured web root
 - Handles dynamic database queries via web interface
 - Supports GET and POST methods
 - Provides full CRUD operations for database records
@@ -25,19 +26,25 @@ Database Lookup Server (port 9999)
 ### 2. Database Lookup Server (`searchdb/mdb-lookup-server`)
 - Loads database into memory at startup
 - Handles search, add, update, delete, and list operations
-- Persists changes to disk automatically
-- Supports multiple concurrent connections
+- Gives every record a stable 64-bit ID
+- Persists each mutation atomically before reporting success
+- Provides structured `LIST2`/`SEARCH2` rows for the HTTP integration while
+  retaining the original human-readable commands
+- Processes one client connection at a time
 
 ### 3. HTTP Client (`clientserv/http-client`)
 - Downloads files from HTTP servers
 - Supports HTTP/1.0 protocol
-- Saves files locally with proper naming
+- Writes through a same-directory temporary file and publishes only complete
+  downloads
+- Refuses to overwrite an existing destination
 
 ## Building the Project
 
 ### Prerequisites
 - GCC compiler
 - Make
+- Python 3 (for the regression suite)
 - Unix-like system
 
 ### Build All Components
@@ -59,6 +66,7 @@ This builds:
 make client      # Build HTTP client only
 make server      # Build HTTP server only
 make database    # Build database server only
+make test        # Build and run the isolated regression suite
 make clean       # Remove all build artifacts
 ```
 
@@ -69,24 +77,19 @@ make clean       # Remove all build artifacts
 Open Terminal 1:
 
 ```bash
-cd searchdb
-./mdb-lookup-server mdb-cs3157 9999
+cp searchdb/mdb-cs3157 /tmp/http-mdb-manual-test.mdb
+./searchdb/mdb-lookup-server /tmp/http-mdb-manual-test.mdb 9999
 ```
 
-The server will display:
-```
-Loaded records from database
-```
-
-Keep this terminal open.
+Use a disposable copy because successful CRUD requests persist changes. Keep
+this terminal open.
 
 ### Step 2: Start HTTP Server
 
 Open Terminal 2:
 
 ```bash
-cd network_programming
-./http-server 8080 html localhost 9999
+./network_programming/http-server 8080 network_programming/html localhost 9999
 ```
 
 The server will start and connect to the database server. Keep this terminal open.
@@ -105,6 +108,9 @@ Open your web browser and navigate to:
 ### Static File Serving
 
 The HTTP server serves static files from the `network_programming/html/` directory.
+Path components are opened relative to that directory without following
+symbolic links. Directories are served only through their own `index.html`,
+and special files such as FIFOs and devices are rejected.
 
 **Access via Browser:**
 ```
@@ -139,15 +145,26 @@ curl "http://localhost:8080/mdb-lookup?key=test%20world"
 
 **Search Behavior:**
 - Searches both name and message fields
-- Case-sensitive substring matching
-- Returns all matching records with record numbers
+- Case-insensitive substring matching
+- Returns all matching records with stable record IDs
 
+### HTTP Client Downloads
 
+Run the client from the directory where the downloaded basename should be
+created:
 
-**Terminal Setup:**
-1. Open Terminal.app
-2. Navigate to project directory: `cd ~/Desktop/HTTP-server-and-client-programming`
-3. Build: `make`
+```bash
+mkdir -p /tmp/http-client-download
+cd /tmp/http-client-download
+/path/to/HTTP-server-and-client-programming/clientserv/http-client \
+  localhost 8080 /ship.jpg
+```
+
+The client keeps partial content in a hidden `.<name>.part.*` file, requires a
+complete response-header block, validates any declared `Content-Length`,
+flushes and syncs the result, and then publishes it without replacing an
+existing file. A malformed, failed, or truncated transfer leaves no final
+output.
 
 ## API Endpoints
 
@@ -170,12 +187,52 @@ curl "http://localhost:8080/mdb-lookup?key=test%20world"
 
 ## Database Format
 
-The database file (`mdb-cs3157`) uses a binary format:
+The database server reads both the original 40-byte legacy record format and
+the versioned `MDB2` format.
 
-- **Record Structure:**
-  - `name[16]` - 16 bytes for name field
-  - `msg[24]` - 24 bytes for message field
-  - Total: 40 bytes per record
+Legacy records contain:
+
+- `name[16]`
+- `msg[24]`
+
+Legacy files are not changed by searches or list operations. On the first
+successful mutation, the server migrates the file atomically to `MDB2`.
+
+`MDB2` uses explicit little-endian serialization:
+
+- 28-byte header: 8-byte magic, 32-bit version, 64-bit next ID, and
+  64-bit record count
+- 48-byte records: 64-bit stable ID, `name[16]`, and `msg[24]`
+
+IDs are monotonic, survive restarts, and are not reused after deletion.
+ADD, UPDATE, and DELETE use clone–persist–swap transactions: the proposed
+state is written, flushed, synced, and atomically renamed before it replaces
+the live in-memory state. A persistence failure leaves both memory and disk
+unchanged.
+
+The HTTP server reads records with the internal `LIST2` and `SEARCH2`
+commands. Each response row contains `id`, `name`, and `message` as three
+tab-separated fields followed by a blank-line terminator. Stored control
+bytes, including tabs and newlines, are rejected, so printable characters
+such as `}` are preserved without ambiguous parsing. The original `LIST` and
+`SEARCH` output remains available to direct backend clients. Because older
+backend binaries do not know the structured commands, upgrade/restart the HTTP
+server and database server together.
+
+## Testing
+
+Run the safe test suite from the project root:
+
+```bash
+make test
+```
+
+`./test_system.sh` is a compatibility wrapper for the same command. Tests
+create temporary database files and web roots, choose unused loopback ports,
+terminate only their own child processes, and exit nonzero on failure. They
+never mutate `searchdb/mdb-cs3157`. Coverage includes exact HTML escaping,
+structured row framing, symlink escape denial, and non-destructive client
+download failures.
 
 
 ## File Structure

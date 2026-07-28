@@ -1,7 +1,7 @@
 # Root Makefile for HTTP Server and Client Programming Project
 # Builds all components: HTTP client, HTTP server, and database lookup server
 
-.PHONY: all clean client server database
+.PHONY: all clean client server database test
 
 # Default target: build all components
 all: client server database
@@ -21,6 +21,10 @@ database:
 	@echo "Building database lookup server..."
 	cd searchdb && $(MAKE)
 
+# Run tests against generated temporary web roots and database files.
+test: all
+	python3 -m unittest discover -s tests -v
+
 # Clean all build artifacts
 clean:
 	@echo "Cleaning all components..."
@@ -35,6 +39,6 @@ help:
 	@echo "  client   - Build HTTP client only"
 	@echo "  server   - Build HTTP server only"
 	@echo "  database - Build database lookup server only"
+	@echo "  test     - Build and run the isolated regression suite"
 	@echo "  clean    - Remove all build artifacts"
 	@echo "  help     - Show this help message"
-

@@ -8,10 +8,10 @@ LDLIBS  =
 mdb-lookup-server: mdb-lookup-server.o mylist.o
 	$(CC) $(CFLAGS) mdb-lookup-server.o mylist.o -o mdb-lookup-server
 
-mdb-lookup-server.o: mdb.h mylist.h
+mdb-lookup-server.o: mdb-lookup-server.c mdb.h mylist.h
 	$(CC) $(CFLAGS) -c mdb-lookup-server.c
 
-mylist.o: mylist.h
+mylist.o: mylist.c mylist.h
 	$(CC) $(CFLAGS) -c mylist.c
 
 .PHONY: clean

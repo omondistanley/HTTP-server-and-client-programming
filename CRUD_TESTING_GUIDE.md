@@ -2,19 +2,43 @@
 
 This guide shows you how to test all database operations: Search, List, Add, Update, and Delete.
 
-## Prerequisites
+## Automated Regression Test
+
+Run the complete isolated suite first:
+
+```bash
+make test
+```
+
+The suite builds all three programs, uses random loopback ports, creates a
+temporary web root and database for every test, and terminates only the
+processes it starts. It does not modify `searchdb/mdb-cs3157`.
+
+The regression suite also verifies exact HTML escaping, printable delimiter
+characters such as `}`, structured backend framing (including legacy empty
+fields), static-path symlink confinement, and atomic client failure cleanup.
+
+## Manual-Test Prerequisites
+
+To avoid changing the repository's database while testing mutations, make a
+disposable copy from the project root:
+
+```bash
+cp searchdb/mdb-cs3157 /tmp/http-mdb-manual-test.mdb
+```
 
 1. **Start the Database Server** (Terminal 1):
 ```bash
-cd searchdb
-./mdb-lookup-server mdb-cs3157 9999
+./searchdb/mdb-lookup-server /tmp/http-mdb-manual-test.mdb 9999
 ```
 
 2. **Start the HTTP Server** (Terminal 2):
 ```bash
-cd network_programming
-./http-server 8080 html localhost 9999
+./network_programming/http-server 8080 network_programming/html localhost 9999
 ```
+
+Restart both processes after rebuilding; an already-running process continues
+to execute the old binary.
 
 ## Testing All Operations
 
@@ -70,23 +94,27 @@ curl http://localhost:8080/mdb-list
 **Via Web Browser:**
 1. Navigate to: `http://localhost:8080/mdb-add`
 2. Fill in the form:
-   - **Name:** (max 15 characters)
-   - **Message:** (max 23 characters)
+   - **Name:** (max 15 bytes)
+   - **Message:** (max 23 bytes)
 3. Click "Add"
 4. **Expected:** Redirects to `/mdb-list` showing the new record
 
 **Via Command Line (POST):**
 ```bash
 # Add a new record
-curl -X POST "http://localhost:8080/mdb-add" \
+curl -L \
   -d "name=John&msg=Hello World" \
-  -L  # Follow redirects
+  "http://localhost:8080/mdb-add"
 
 # Add another record
-curl -X POST "http://localhost:8080/mdb-add" \
+curl -L \
   -d "name=Jane&msg=Testing 123" \
-  -L
+  "http://localhost:8080/mdb-add"
 ```
+
+Do not combine `-X POST` with `-L` here. With an explicit method, curl can
+repeat POST against the redirect target; `-d` selects POST for the first
+request and lets curl follow the server's `302` with GET.
 
 **What to verify:**
 - ✅ Form displays correctly
@@ -108,13 +136,14 @@ curl -X POST "http://localhost:8080/mdb-add" \
 
 **Via Command Line:**
 ```bash
-# First, get the edit form (replace X with actual ID)
-curl "http://localhost:8080/mdb-edit?id=1"
+# First, read the stable ID from the list, then get the edit form
+curl "http://localhost:8080/mdb-list"
+curl "http://localhost:8080/mdb-edit?id=RECORD_ID"
 
-# Update a record (replace X with actual ID)
-curl -X POST "http://localhost:8080/mdb-update" \
-  -d "id=1&name=UpdatedName&msg=Updated Message" \
-  -L
+# Update that record
+curl -L \
+  -d "id=RECORD_ID&name=UpdatedName&msg=Updated Message" \
+  "http://localhost:8080/mdb-update"
 ```
 
 **What to verify:**
@@ -136,10 +165,10 @@ curl -X POST "http://localhost:8080/mdb-update" \
 
 **Via Command Line:**
 ```bash
-# Delete a record (replace X with actual ID)
-curl -X POST "http://localhost:8080/mdb-delete" \
-  -d "id=1" \
-  -L
+# Delete a record using the stable ID shown by /mdb-list
+curl -L \
+  -d "id=RECORD_ID" \
+  "http://localhost:8080/mdb-delete"
 ```
 
 **What to verify:**
@@ -156,12 +185,7 @@ curl -X POST "http://localhost:8080/mdb-delete" \
 Here's a suggested workflow to test everything:
 
 ```bash
-# 1. Start both servers (in separate terminals)
-# Terminal 1:
-cd searchdb && ./mdb-lookup-server mdb-cs3157 9999
-
-# Terminal 2:
-cd network_programming && ./http-server 8080 html localhost 9999
+# 1. Start both servers as shown in Manual-Test Prerequisites.
 
 # 2. Test Search
 curl "http://localhost:8080/mdb-lookup?key=test"
@@ -170,21 +194,51 @@ curl "http://localhost:8080/mdb-lookup?key=test"
 curl http://localhost:8080/mdb-list
 
 # 4. Test Add
-curl -X POST "http://localhost:8080/mdb-add" -d "name=TestUser&msg=TestMessage" -L
+curl -L -d "name=TestUser&msg=TestMessage" "http://localhost:8080/mdb-add"
 
 # 5. Test Search again (should find the new record)
 curl "http://localhost:8080/mdb-lookup?key=TestUser"
 
-# 6. Test Edit (get ID from list, then update)
-curl "http://localhost:8080/mdb-edit?id=1"  # View edit form
-curl -X POST "http://localhost:8080/mdb-update" -d "id=1&name=Updated&msg=NewMsg" -L
+# 6. Get the new stable ID from the list, then edit and update it
+curl "http://localhost:8080/mdb-list"
+curl "http://localhost:8080/mdb-edit?id=RECORD_ID"
+curl -L -d "id=RECORD_ID&name=Updated&msg=NewMsg" \
+  "http://localhost:8080/mdb-update"
 
 # 7. Test Delete
-curl -X POST "http://localhost:8080/mdb-delete" -d "id=1" -L
+curl -L -d "id=RECORD_ID" "http://localhost:8080/mdb-delete"
 
 # 8. Verify deletion
 curl "http://localhost:8080/mdb-lookup?key=Updated"  # Should not find it
 ```
+
+Every successful ADD, UPDATE, or DELETE is persisted before the HTTP server
+returns its redirect. Restart both servers and list the records again to
+verify restart durability.
+
+## Stable IDs and Persistence
+
+- Legacy 40-byte database files remain unchanged during LIST and SEARCH.
+- The first successful mutation migrates a legacy file to versioned `MDB2`.
+- Record IDs are unsigned 64-bit values stored in the file, remain stable
+  across deletions and restarts, and are never reassigned.
+- Mutations use clone–persist–swap: a temporary file is written, flushed,
+  synced, and atomically renamed before in-memory state changes.
+- A persistence error returns HTTP `500` and leaves both memory and disk
+  unchanged. A syntactically valid but absent update/delete ID returns `404`.
+
+## Rendering and Backend Framing
+
+- `<`, `>`, `&`, `"`, and `'` are escaped before names, messages, or search
+  values are inserted into HTML text or form attributes.
+- Printable braces are valid record content and survive list, search, edit,
+  update, restart, and delete operations.
+- The HTTP server uses the backend's `LIST2` and `SEARCH2` commands. Their
+  records are `id<TAB>name<TAB>message`, with a blank line ending each
+  response. Because stored control bytes are rejected, the two separators
+  cannot be confused with field content.
+- The legacy human-readable `LIST` and `SEARCH` commands remain available for
+  direct backend testing and compatibility.
 
 ---
 
@@ -192,9 +246,10 @@ curl "http://localhost:8080/mdb-lookup?key=Updated"  # Should not find it
 
 ### Search Returns Nothing
 - ✅ Check that database server is running
-- ✅ Verify database file has data: `cat searchdb/mdb-cs3157`
+- ✅ Verify the database file exists and is nonempty: `ls -l /tmp/http-mdb-manual-test.mdb`
 - ✅ Check HTTP server logs for errors
-- ✅ Test backend directly: `echo "SEARCH test" | nc localhost 9999`
+- ✅ To test the backend directly, stop the HTTP server first, then run:
+  `printf 'SEARCH test\n' | nc localhost 9999`
 
 ### Add/Update/Delete Not Working
 - ✅ Check backend connection in HTTP server logs
@@ -205,7 +260,8 @@ curl "http://localhost:8080/mdb-lookup?key=Updated"  # Should not find it
 ### List Shows No Records
 - ✅ Verify database file exists and has data
 - ✅ Check backend server is responding
-- ✅ Test LIST command directly: `echo "LIST" | nc localhost 9999`
+- ✅ With the HTTP server stopped, test LIST directly:
+  `printf 'LIST\n' | nc localhost 9999`
 
 ### Connection Errors
 - ✅ Ensure database server starts BEFORE HTTP server
@@ -241,4 +297,8 @@ curl "http://localhost:8080/mdb-lookup?key=Updated"  # Should not find it
 ✅ Navigation links work between pages  
 ✅ Error handling works (invalid IDs, missing fields, etc.)  
 ✅ Redirects work correctly after POST operations  
-
+✅ Stable IDs survive deletion and restart
+✅ A forced persistence failure changes neither memory nor disk
+✅ HTML metacharacters are escaped exactly and braces remain intact
+✅ Static symlinks cannot expose files outside the web root
+✅ Failed client downloads neither clobber nor leave a final destination

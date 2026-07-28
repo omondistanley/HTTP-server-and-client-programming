@@ -1,3 +1,6 @@
+#define _POSIX_C_SOURCE 200809L
+#define _DARWIN_C_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -83,37 +86,57 @@ static int url_decode_component(
 }
 
 static void html_escape(const char *src, char *dest, size_t dest_size) {
-    const char *p = src;
-    char *q = dest;
-    size_t remaining = dest_size - 1;
-    
-    while (*p && remaining > 0) {
-        if (*p == '<' && remaining >= 4) {
-            strncpy(q, "&lt;", 4);
-            q += 4;
-            remaining -= 4;
-        } else if (*p == '>' && remaining >= 4) {
-            strncpy(q, "&gt;", 4);
-            q += 4;
-            remaining -= 4;
-        } else if (*p == '&' && remaining >= 5) {
-            strncpy(q, "&amp;", 5);
-            q += 5;
-            remaining -= 5;
-        } else if (*p == '"' && remaining >= 6) {
-            strncpy(q, "&quot;", 6);
-            q += 6;
-            remaining -= 6;
-        } else if (*p == '\'' && remaining >= 6) {
-            strncpy(q, "&#39;", 5);
-            q += 5;
-            remaining -= 5;
-        } else {
-            *q++ = *p++;
-            remaining--;
+    size_t used = 0;
+
+    if (!dest || dest_size == 0) return;
+    dest[0] = '\0';
+    if (!src) return;
+
+    while (*src) {
+        const char *replacement = NULL;
+        size_t replacement_length = 0;
+
+        switch (*src) {
+            case '<':
+                replacement = "&lt;";
+                replacement_length = 4;
+                break;
+            case '>':
+                replacement = "&gt;";
+                replacement_length = 4;
+                break;
+            case '&':
+                replacement = "&amp;";
+                replacement_length = 5;
+                break;
+            case '"':
+                replacement = "&quot;";
+                replacement_length = 6;
+                break;
+            case '\'':
+                replacement = "&#39;";
+                replacement_length = 5;
+                break;
+            default:
+                replacement_length = 1;
+                break;
         }
+
+        /*
+         * Callers size output for the six-byte worst case. If that invariant
+         * is ever broken, return a safely terminated prefix rather than
+         * copying a special character without escaping it.
+         */
+        if (replacement_length > dest_size - 1 - used) break;
+        if (replacement) {
+            memcpy(dest + used, replacement, replacement_length);
+        } else {
+            dest[used] = *src;
+        }
+        used += replacement_length;
+        src++;
     }
-    *q = '\0';
+    dest[used] = '\0';
 }
 
 /*
@@ -207,6 +230,68 @@ static int parse_positive_u64(const char *text, uint64_t *result) {
         return -1;
     }
     *result = (uint64_t)value;
+    return 0;
+}
+
+struct BackendRecord {
+    uint64_t id;
+    char name[MAX_NAME_LEN + 1];
+    char message[MAX_MSG_LEN + 1];
+};
+
+/*
+ * LIST2 and SEARCH2 return exactly three tab-separated fields. Tabs and other
+ * control bytes are not valid database field data, so the delimiters are
+ * unambiguous even for legacy empty fields and printable punctuation.
+ */
+static int parse_backend_record(char *line, struct BackendRecord *record) {
+    char *name;
+    char *message;
+    char *first_tab;
+    char *second_tab;
+    size_t line_length;
+    size_t name_length;
+    size_t message_length;
+
+    if (!line || !record) return -1;
+
+    line_length = strlen(line);
+    while (line_length > 0 &&
+           (line[line_length - 1] == '\n' ||
+            line[line_length - 1] == '\r')) {
+        line[--line_length] = '\0';
+    }
+    if (line_length == 0) return -1;
+
+    first_tab = strchr(line, '\t');
+    if (!first_tab) return -1;
+    second_tab = strchr(first_tab + 1, '\t');
+    if (!second_tab || strchr(second_tab + 1, '\t')) return -1;
+
+    *first_tab = '\0';
+    *second_tab = '\0';
+    name = first_tab + 1;
+    message = second_tab + 1;
+    name_length = strlen(name);
+    message_length = strlen(message);
+
+    if (parse_positive_u64(line, &record->id) < 0 ||
+        name_length > MAX_NAME_LEN ||
+        message_length > MAX_MSG_LEN) {
+        return -1;
+    }
+
+    for (size_t i = 0; i < name_length; i++) {
+        unsigned char c = (unsigned char)name[i];
+        if (c < 32 || c == 127) return -1;
+    }
+    for (size_t i = 0; i < message_length; i++) {
+        unsigned char c = (unsigned char)message[i];
+        if (c < 32 || c == 127) return -1;
+    }
+
+    memcpy(record->name, name, name_length + 1);
+    memcpy(record->message, message, message_length + 1);
     return 0;
 }
 
@@ -566,21 +651,225 @@ static int forbidden_dotdot(const char *uri) {
     return 0;
 }
 
-static int validate_file_path(const char *web_root, const char *uri, char *path, size_t path_size) {
-    if (uri[0] != '/') {
-        return -1;
+enum StaticFileResult {
+    STATIC_FILE_OK = 0,
+    STATIC_FILE_NOT_FOUND,
+    STATIC_FILE_FORBIDDEN,
+    STATIC_FILE_PATH_TOO_LONG,
+    STATIC_FILE_ERROR
+};
+
+enum StaticEntryType {
+    STATIC_ENTRY_DIRECTORY,
+    STATIC_ENTRY_REGULAR,
+    STATIC_ENTRY_REGULAR_OR_DIRECTORY
+};
+
+static enum StaticFileResult static_error_result(int error_number) {
+    switch (error_number) {
+        case ENOENT:
+        case ENOTDIR:
+            return STATIC_FILE_NOT_FOUND;
+        case ELOOP:
+        case EACCES:
+        case EPERM:
+            return STATIC_FILE_FORBIDDEN;
+        case ENAMETOOLONG:
+            return STATIC_FILE_PATH_TOO_LONG;
+        default:
+            return STATIC_FILE_ERROR;
     }
-    
-    int ret = snprintf(path, path_size, "%s%s", web_root, uri);
-    if (ret < 0 || ret >= (int)path_size) {
-        return -1;
+}
+
+static int static_type_matches(mode_t mode, enum StaticEntryType expected) {
+    if (expected == STATIC_ENTRY_DIRECTORY) return S_ISDIR(mode);
+    if (expected == STATIC_ENTRY_REGULAR) return S_ISREG(mode);
+    return S_ISDIR(mode) || S_ISREG(mode);
+}
+
+/*
+ * The fstatat() check provides deterministic rejection of symlinks. openat()
+ * with O_NOFOLLOW is the security boundary if an entry is replaced between
+ * that check and the open, and fstat() verifies the object actually opened.
+ */
+static enum StaticFileResult open_static_entry(
+    int directory_fd,
+    const char *name,
+    enum StaticEntryType expected,
+    int *opened_fd,
+    struct stat *opened_stat
+) {
+    struct stat entry_stat;
+    int flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW;
+    int fd;
+
+    if (fstatat(
+            directory_fd,
+            name,
+            &entry_stat,
+            AT_SYMLINK_NOFOLLOW) < 0) {
+        return static_error_result(errno);
     }
-    
-    if (strstr(path, "/../") != NULL || strstr(path, "..") != NULL) {
-        return -1;
+    if (S_ISLNK(entry_stat.st_mode)) return STATIC_FILE_FORBIDDEN;
+    if (!static_type_matches(entry_stat.st_mode, expected)) {
+        return expected == STATIC_ENTRY_DIRECTORY
+                   ? STATIC_FILE_NOT_FOUND
+                   : STATIC_FILE_FORBIDDEN;
     }
-    
-    return 0;
+
+    if (expected == STATIC_ENTRY_DIRECTORY) {
+        flags |= O_DIRECTORY;
+    } else {
+        /*
+         * Avoid blocking on a special file even if it replaces the entry
+         * between fstatat() and openat(). Regular files ignore O_NONBLOCK.
+         */
+        flags |= O_NONBLOCK;
+    }
+
+    fd = openat(directory_fd, name, flags);
+    if (fd < 0) return static_error_result(errno);
+    if (fstat(fd, &entry_stat) < 0) {
+        int saved_errno = errno;
+        close(fd);
+        return static_error_result(saved_errno);
+    }
+    if (!static_type_matches(entry_stat.st_mode, expected)) {
+        close(fd);
+        return expected == STATIC_ENTRY_DIRECTORY
+                   ? STATIC_FILE_NOT_FOUND
+                   : STATIC_FILE_FORBIDDEN;
+    }
+
+    *opened_fd = fd;
+    if (opened_stat) *opened_stat = entry_stat;
+    return STATIC_FILE_OK;
+}
+
+static enum StaticFileResult open_static_file(
+    int web_root_fd,
+    const char *uri,
+    int *file_fd,
+    struct stat *file_stat,
+    int *serves_index
+) {
+    char relative[MAX_URI_LEN];
+    char *save_pointer = NULL;
+    char *component;
+    char *next_component;
+    size_t uri_length;
+    int trailing_slash;
+    int directory_fd;
+    enum StaticFileResult result;
+
+    if (!uri || uri[0] != '/' || !file_fd || !file_stat || !serves_index) {
+        return STATIC_FILE_FORBIDDEN;
+    }
+
+    uri_length = strlen(uri);
+    if (uri_length >= sizeof(relative)) return STATIC_FILE_PATH_TOO_LONG;
+    trailing_slash = uri_length > 0 && uri[uri_length - 1] == '/';
+    memcpy(relative, uri + 1, uri_length);
+
+    *file_fd = -1;
+    *serves_index = 0;
+    directory_fd = dup(web_root_fd);
+    if (directory_fd < 0) return STATIC_FILE_ERROR;
+
+    component = strtok_r(relative, "/", &save_pointer);
+    if (!component) {
+        result = open_static_entry(
+            directory_fd,
+            "index.html",
+            STATIC_ENTRY_REGULAR,
+            file_fd,
+            file_stat);
+        close(directory_fd);
+        if (result == STATIC_FILE_OK) *serves_index = 1;
+        return result;
+    }
+
+    next_component = strtok_r(NULL, "/", &save_pointer);
+    while (next_component) {
+        int next_directory_fd;
+
+        if (strcmp(component, ".") == 0 ||
+            strcmp(component, "..") == 0) {
+            close(directory_fd);
+            return STATIC_FILE_FORBIDDEN;
+        }
+        result = open_static_entry(
+            directory_fd,
+            component,
+            STATIC_ENTRY_DIRECTORY,
+            &next_directory_fd,
+            NULL);
+        close(directory_fd);
+        if (result != STATIC_FILE_OK) return result;
+        directory_fd = next_directory_fd;
+        component = next_component;
+        next_component = strtok_r(NULL, "/", &save_pointer);
+    }
+
+    if (strcmp(component, ".") == 0 || strcmp(component, "..") == 0) {
+        close(directory_fd);
+        return STATIC_FILE_FORBIDDEN;
+    }
+
+    result = open_static_entry(
+        directory_fd,
+        component,
+        STATIC_ENTRY_REGULAR_OR_DIRECTORY,
+        file_fd,
+        file_stat);
+    close(directory_fd);
+    if (result != STATIC_FILE_OK) return result;
+
+    if (S_ISDIR(file_stat->st_mode)) {
+        int index_fd;
+
+        if (!trailing_slash) {
+            close(*file_fd);
+            *file_fd = -1;
+            return STATIC_FILE_FORBIDDEN;
+        }
+        result = open_static_entry(
+            *file_fd,
+            "index.html",
+            STATIC_ENTRY_REGULAR,
+            &index_fd,
+            file_stat);
+        close(*file_fd);
+        *file_fd = -1;
+        if (result != STATIC_FILE_OK) return result;
+        *file_fd = index_fd;
+        *serves_index = 1;
+    } else if (trailing_slash) {
+        close(*file_fd);
+        *file_fd = -1;
+        return STATIC_FILE_NOT_FOUND;
+    }
+
+    return STATIC_FILE_OK;
+}
+
+static const char *static_content_type(const char *uri, int serves_index) {
+    const char *extension;
+
+    if (serves_index) return "text/html";
+    extension = strrchr(uri, '.');
+    if (!extension || strchr(extension, '/')) return "application/octet-stream";
+    if (strcasecmp(extension, ".html") == 0 ||
+        strcasecmp(extension, ".htm") == 0) {
+        return "text/html";
+    }
+    if (strcasecmp(extension, ".jpg") == 0 ||
+        strcasecmp(extension, ".jpeg") == 0) {
+        return "image/jpeg";
+    }
+    if (strcasecmp(extension, ".png") == 0) return "image/png";
+    if (strcasecmp(extension, ".gif") == 0) return "image/gif";
+    return "application/octet-stream";
 }
 
 struct BackendConnection {
@@ -693,6 +982,12 @@ int main(int argc, char **argv) {
     if (strlen(web_root) == 0 || strlen(web_root) > MAX_PATH_LEN) {
         fprintf(stderr, "Error: Invalid web root path\n");
         exit(1);
+    }
+    int web_root_fd = open(
+        web_root,
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (web_root_fd < 0) {
+        die("open web root failed");
     }
 
     struct BackendConnection backend_conn;
@@ -979,7 +1274,7 @@ int main(int argc, char **argv) {
                 "<form method=GET action=/mdb-lookup>\n"
                 "lookup: <input type=text name=key value=\"";
             char header[8192];
-            char escaped_key[6001];
+            char escaped_key[MAX_SEARCH_KEY_LEN * 6 + 1];
             html_escape(decoded_key, escaped_key, sizeof(escaped_key));
             snprintf(header, sizeof(header),
                 "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n\r\n%s%s\">\n"
@@ -989,7 +1284,9 @@ int main(int argc, char **argv) {
                 "<a href=\"/mdb-list\">List All Records</a> | <a href=\"/mdb-add\">Add New Record</a>\n"
                 "<p>\n"
                 "<table border=\"1\" cellpadding=\"5\" cellspacing=\"0\">\n"
-                "<tr><th>#</th><th>Record</th></tr>\n", form, escaped_key);
+                "<tr><th>#</th><th>ID</th><th>Name</th><th>Message</th></tr>\n",
+                form,
+                escaped_key);
             if (send(clntsock, header, strlen(header), 0) < 0) {
                 fclose(fp);
                 continue;
@@ -998,7 +1295,7 @@ int main(int argc, char **argv) {
             if (backend_conn.fp == NULL || feof(backend_conn.fp) || ferror(backend_conn.fp)) {
                 fprintf(stderr, "Backend connection lost, reconnecting...\n");
                 if (reconnect_backend(&backend_conn) < 0) {
-                    char error_msg[] = "<tr><td colspan=2>Error: Backend server unavailable</td></tr>\n";
+                    char error_msg[] = "<tr><td colspan=4>Error: Backend server unavailable</td></tr>\n";
                     send(clntsock, error_msg, strlen(error_msg), 0);
                     send(clntsock, "</table>\n", 9, 0);
                     snprintf(resp, sizeof(resp), "503 Service Unavailable");
@@ -1009,11 +1306,11 @@ int main(int argc, char **argv) {
                 }
             }
 
-            if (fprintf(backend_conn.fp, "SEARCH %s\n", decoded_key) < 0 ||
+            if (fprintf(backend_conn.fp, "SEARCH2 %s\n", decoded_key) < 0 ||
                 fflush(backend_conn.fp) != 0) {
                 fprintf(stderr, "Error writing to backend, reconnecting...\n");
                 if (reconnect_backend(&backend_conn) < 0) {
-                    char error_msg[] = "<tr><td colspan=2>Error: Backend server unavailable</td></tr>\n";
+                    char error_msg[] = "<tr><td colspan=4>Error: Backend server unavailable</td></tr>\n";
                     send(clntsock, error_msg, strlen(error_msg), 0);
                     send(clntsock, "</table>\n", 9, 0);
                     snprintf(resp, sizeof(resp), "503 Service Unavailable");
@@ -1022,7 +1319,7 @@ int main(int argc, char **argv) {
                     fclose(fp);
                     continue;
                 }
-                fprintf(backend_conn.fp, "SEARCH %s\n", decoded_key);
+                fprintf(backend_conn.fp, "SEARCH2 %s\n", decoded_key);
                 fflush(backend_conn.fp);
             }
 
@@ -1053,10 +1350,35 @@ int main(int argc, char **argv) {
                     break;
                 }
                 
-                char escaped_line[1200];
-                html_escape(line, escaped_line, sizeof(escaped_line));
-                char rowbuf[1400];
-                snprintf(rowbuf, sizeof(rowbuf), "<tr><td>%d</td><td>%s</td></tr>\n", row++, escaped_line);
+                struct BackendRecord record;
+                if (parse_backend_record(line, &record) < 0) {
+                    fprintf(stderr, "Ignoring malformed SEARCH2 response row\n");
+                    continue;
+                }
+
+                char escaped_name[MAX_NAME_LEN * 6 + 1];
+                char escaped_message[MAX_MSG_LEN * 6 + 1];
+                html_escape(
+                    record.name,
+                    escaped_name,
+                    sizeof(escaped_name));
+                html_escape(
+                    record.message,
+                    escaped_message,
+                    sizeof(escaped_message));
+
+                char rowbuf[
+                    MAX_NAME_LEN * 6 +
+                    MAX_MSG_LEN * 6 +
+                    256];
+                snprintf(
+                    rowbuf,
+                    sizeof(rowbuf),
+                    "<tr><td>%d</td><td>%" PRIu64 "</td><td>%s</td><td>%s</td></tr>\n",
+                    row++,
+                    record.id,
+                    escaped_name,
+                    escaped_message);
                 if (client_write_ok &&
                     send(clntsock, rowbuf, strlen(rowbuf), 0) < 0) {
                     fprintf(stderr, "Error sending to client\n");
@@ -1076,19 +1398,19 @@ int main(int argc, char **argv) {
             
             if (!found_any) {
                 if (got_empty_line) {
-                    char not_found_msg[] = "<tr><td colspan=\"2\"><strong>ENTRY NOT FOUND</strong></td></tr>\n";
+                    char not_found_msg[] = "<tr><td colspan=\"4\"><strong>ENTRY NOT FOUND</strong></td></tr>\n";
                     if (client_write_ok) {
                         send(clntsock, not_found_msg, strlen(not_found_msg), 0);
                     }
                     fprintf(stderr, "Search for '%s' returned no matches\n", decoded_key);
                 } else if (feof(backend_conn.fp)) {
-                    char error_msg[] = "<tr><td colspan=\"2\">Error: Database connection closed</td></tr>\n";
+                    char error_msg[] = "<tr><td colspan=\"4\">Error: Database connection closed</td></tr>\n";
                     if (client_write_ok) {
                         send(clntsock, error_msg, strlen(error_msg), 0);
                     }
                     fprintf(stderr, "Backend connection closed during search for: %s\n", decoded_key);
                 } else {
-                    char error_msg[] = "<tr><td colspan=\"2\">Error: No response from database</td></tr>\n";
+                    char error_msg[] = "<tr><td colspan=\"4\">Error: No response from database</td></tr>\n";
                     if (client_write_ok) {
                         send(clntsock, error_msg, strlen(error_msg), 0);
                     }
@@ -1120,7 +1442,7 @@ int main(int argc, char **argv) {
                 }
             }
 
-            fprintf(backend_conn.fp, "LIST\n");
+            fprintf(backend_conn.fp, "LIST2\n");
             fflush(backend_conn.fp);
 
             char html[8192];
@@ -1144,24 +1466,23 @@ int main(int argc, char **argv) {
             char line[1024];
             while (fgets(line, sizeof(line), backend_conn.fp)) {
                 if (strcmp(line, "\n") == 0 || strcmp(line, "\r\n") == 0) break;
-                size_t llen = strlen(line);
-                if (llen > 0 && (line[llen-1] == '\n' || line[llen-1] == '\r')) line[--llen] = '\0';
-                
-                uint64_t id;
-                char name[16], msg[24];
-                const char *p = line;
-                while (*p == ' ' || *p == '\t') p++;
-                if (sscanf(
-                        p,
-                        "%" SCNu64 ". {%15[^}]},said {%23[^}]}",
-                        &id,
-                        name,
-                        msg) == 3) {
-                    char escaped_name[64], escaped_msg[64];
-                    html_escape(name, escaped_name, sizeof(escaped_name));
-                    html_escape(msg, escaped_msg, sizeof(escaped_msg));
+                struct BackendRecord record;
+                if (parse_backend_record(line, &record) == 0) {
+                    char escaped_name[MAX_NAME_LEN * 6 + 1];
+                    char escaped_msg[MAX_MSG_LEN * 6 + 1];
+                    html_escape(
+                        record.name,
+                        escaped_name,
+                        sizeof(escaped_name));
+                    html_escape(
+                        record.message,
+                        escaped_msg,
+                        sizeof(escaped_msg));
                     
-                    char row[512];
+                    char row[
+                        MAX_NAME_LEN * 6 +
+                        MAX_MSG_LEN * 6 +
+                        512];
                     snprintf(row, sizeof(row),
                         "<tr><td>%" PRIu64 "</td><td>%s</td><td>%s</td>"
                         "<td><a href=\"/mdb-edit?id=%" PRIu64 "\">Edit</a> | "
@@ -1169,7 +1490,11 @@ int main(int argc, char **argv) {
                         "<input type=hidden name=id value=%" PRIu64 ">"
                         "<input type=submit value=Delete onclick=\"return confirm('Delete this record?')\">"
                         "</form></td></tr>\n",
-                        id, escaped_name, escaped_msg, id, id);
+                        record.id,
+                        escaped_name,
+                        escaped_msg,
+                        record.id,
+                        record.id);
                     if (client_write_ok &&
                         send(clntsock, row, strlen(row), 0) < 0) {
                         client_write_ok = 0;
@@ -1289,7 +1614,7 @@ int main(int argc, char **argv) {
                 }
             }
 
-            fprintf(backend_conn.fp, "LIST\n");
+            fprintf(backend_conn.fp, "LIST2\n");
             fflush(backend_conn.fp);
 
             char line[1024];
@@ -1297,19 +1622,11 @@ int main(int argc, char **argv) {
             int found = 0;
             while (fgets(line, sizeof(line), backend_conn.fp)) {
                 if (strcmp(line, "\n") == 0 || strcmp(line, "\r\n") == 0) break;
-                size_t llen = strlen(line);
-                if (llen > 0 && (line[llen-1] == '\n' || line[llen-1] == '\r')) line[--llen] = '\0';
-                
-                uint64_t id;
-                char candidate_name[16], candidate_msg[24];
-                if (sscanf(
-                        line,
-                        "%" SCNu64 ". {%15[^}]},said {%23[^}]}",
-                        &id,
-                        candidate_name,
-                        candidate_msg) == 3 && id == edit_id) {
-                    strcpy(name, candidate_name);
-                    strcpy(msg, candidate_msg);
+                struct BackendRecord record;
+                if (parse_backend_record(line, &record) == 0 &&
+                    record.id == edit_id) {
+                    memcpy(name, record.name, strlen(record.name) + 1);
+                    memcpy(msg, record.message, strlen(record.message) + 1);
                     found = 1;
                 }
             }
@@ -1322,7 +1639,8 @@ int main(int argc, char **argv) {
                 continue;
             }
 
-            char escaped_name[64], escaped_msg[64];
+            char escaped_name[MAX_NAME_LEN * 6 + 1];
+            char escaped_msg[MAX_MSG_LEN * 6 + 1];
             html_escape(name, escaped_name, sizeof(escaped_name));
             html_escape(msg, escaped_msg, sizeof(escaped_msg));
 
@@ -1478,114 +1796,80 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        char path[MAX_PATH_LEN];
-        if (validate_file_path(web_root, requestURI, path, sizeof(path)) < 0) {
-            char header[] = "HTTP/1.0 400 Bad Request\r\nContent-Type: text/html\r\n\r\n"
-                            "<!DOCTYPE html><html><body><h1>400 Bad Request: Invalid path</h1></body></html>\n";
-            snprintf(resp, sizeof(resp), "400 Bad Request");
-            send(clntsock, header, strlen(header), 0);
+        int static_fd = -1;
+        struct stat st;
+        int serves_index = 0;
+        enum StaticFileResult static_result = open_static_file(
+            web_root_fd,
+            requestURI,
+            &static_fd,
+            &st,
+            &serves_index);
+
+        if (static_result != STATIC_FILE_OK) {
+            const char *status;
+            if (static_result == STATIC_FILE_NOT_FOUND) {
+                status = "404 Not Found";
+            } else if (static_result == STATIC_FILE_FORBIDDEN) {
+                status = "403 Forbidden";
+            } else if (static_result == STATIC_FILE_PATH_TOO_LONG) {
+                status = "414 URI Too Long";
+            } else {
+                status = "500 Internal Server Error";
+            }
+            snprintf(resp, sizeof(resp), "%s", status);
+            send_error_page(clntsock, status, NULL);
             fprintf(stdout, "%s \"%s %s %s\" %s\n", inet_ntoa(clntaddr.sin_addr),
                 method, requestURI, httpVersion, resp);
             fclose(fp);
             continue;
         }
 
-        struct stat st;
-        if (stat(path, &st) == 0) {
-            if (S_ISDIR(st.st_mode)) {
-                if (requestURI[strlen(requestURI) - 1] != '/') {
-                    char header[] = "HTTP/1.0 403 Forbidden\r\nContent-Type: text/html\r\n\r\n"
-                                    "<!DOCTYPE html><html><body><h1>403 Forbidden</h1></body></html>\n";
-                    snprintf(resp, sizeof(resp), "403 Forbidden");
-                    send(clntsock, header, strlen(header), 0);
-                    fprintf(stdout, "%s \"%s %s %s\" %s\n", inet_ntoa(clntaddr.sin_addr),
-                        method, requestURI, httpVersion, resp);
-                    fclose(fp);
-                    continue;
-                }
-                size_t current_len = strlen(path);
-                if (current_len + 11 < sizeof(path)) {
-                    strncat(path, "index.html", sizeof(path) - current_len - 1);
-                } else {
-                    char header[] = "HTTP/1.0 414 URI Too Long\r\nContent-Type: text/html\r\n\r\n"
-                                    "<!DOCTYPE html><html><body><h1>414 URI Too Long</h1></body></html>\n";
-                    snprintf(resp, sizeof(resp), "414 URI Too Long");
-                    send(clntsock, header, strlen(header), 0);
-                    fprintf(stdout, "%s \"%s %s %s\" %s\n", inet_ntoa(clntaddr.sin_addr),
-                        method, requestURI, httpVersion, resp);
-                    fclose(fp);
-                    continue;
-                }
-                if (stat(path, &st) != 0) {
-                    char header[] = "HTTP/1.0 404 Not Found\r\nContent-Type: text/html\r\n\r\n"
-                                    "<!DOCTYPE html><html><body><h1>404 Not Found</h1></body></html>\n";
-                    snprintf(resp, sizeof(resp), "404 Not Found");
-                    send(clntsock, header, strlen(header), 0);
-                    fprintf(stdout, "%s \"%s %s %s\" %s\n", inet_ntoa(clntaddr.sin_addr),
-                        method, requestURI, httpVersion, resp);
-                    fclose(fp);
-                    continue;
-                }
-            }
-            if (st.st_size > 100 * 1024 * 1024) {
-                char header[] = "HTTP/1.0 413 Payload Too Large\r\nContent-Type: text/html\r\n\r\n"
-                                "<!DOCTYPE html><html><body><h1>413 Payload Too Large</h1></body></html>\n";
-                snprintf(resp, sizeof(resp), "413 Payload Too Large");
-                send(clntsock, header, strlen(header), 0);
-                fprintf(stdout, "%s \"%s %s %s\" %s\n", inet_ntoa(clntaddr.sin_addr),
-                    method, requestURI, httpVersion, resp);
-                fclose(fp);
-                continue;
-            }
-            
-            FILE *file = fopen(path, "rb");
-            if (!file) {
-                char header[] = "HTTP/1.0 404 Not Found\r\nContent-Type: text/html\r\n\r\n"
-                                "<!DOCTYPE html><html><body><h1>404 Not Found</h1></body></html>\n";
-                snprintf(resp, sizeof(resp), "404 Not Found");
-                send(clntsock, header, strlen(header), 0);
-                fprintf(stdout, "%s \"%s %s %s\" %s\n", inet_ntoa(clntaddr.sin_addr),
-                    method, requestURI, httpVersion, resp);
-                fclose(fp);
-                continue;
-            }
-            const char *ctype = "application/octet-stream";
-            if (strstr(path, ".html")) ctype = "text/html";
-            else if (strstr(path, ".jpg")) ctype = "image/jpeg";
-            else if (strstr(path, ".png")) ctype = "image/png";
-            else if (strstr(path, ".gif")) ctype = "image/gif";
-            char header[4096];
-            snprintf(header, sizeof(header),
-                "HTTP/1.0 200 OK\r\nContent-Type: %s\r\nContent-Length: %zu\r\n\r\n",
-                ctype, (size_t)st.st_size);
-            int client_write_ok =
-                send(clntsock, header, strlen(header), 0) >= 0;
-            size_t n;
-            char file_buffer[MAX_REQUEST_LEN];
-            while (client_write_ok &&
-                   (n = fread(file_buffer, 1, sizeof(file_buffer), file)) > 0) {
-                if (send(clntsock, file_buffer, n, 0) < 0) {
-                    client_write_ok = 0;
-                }
-            }
-            fclose(file);
-            snprintf(resp, sizeof(resp), "200 OK");
-            fprintf(stdout, "%s \"%s %s %s\" %s\n", inet_ntoa(clntaddr.sin_addr),
-                method, requestURI, httpVersion, resp);
-            fclose(fp);
-            continue;
-        } else {
-            char header[] = "HTTP/1.0 404 Not Found\r\nContent-Type: text/html\r\n\r\n"
-                            "<!DOCTYPE html><html><body><h1>404 Not Found</h1></body></html>\n";
-            snprintf(resp, sizeof(resp), "404 Not Found");
-            send(clntsock, header, strlen(header), 0);
+        if (st.st_size < 0 || st.st_size > 100 * 1024 * 1024) {
+            close(static_fd);
+            snprintf(resp, sizeof(resp), "413 Payload Too Large");
+            send_error_page(clntsock, "413 Payload Too Large", NULL);
             fprintf(stdout, "%s \"%s %s %s\" %s\n", inet_ntoa(clntaddr.sin_addr),
                 method, requestURI, httpVersion, resp);
             fclose(fp);
             continue;
         }
+
+        FILE *file = fdopen(static_fd, "rb");
+        if (!file) {
+            close(static_fd);
+            snprintf(resp, sizeof(resp), "500 Internal Server Error");
+            send_error_page(clntsock, "500 Internal Server Error", NULL);
+            fprintf(stdout, "%s \"%s %s %s\" %s\n", inet_ntoa(clntaddr.sin_addr),
+                method, requestURI, httpVersion, resp);
+            fclose(fp);
+            continue;
+        }
+
+        const char *ctype = static_content_type(requestURI, serves_index);
+        char header[4096];
+        snprintf(header, sizeof(header),
+            "HTTP/1.0 200 OK\r\nContent-Type: %s\r\nContent-Length: %zu\r\n\r\n",
+            ctype, (size_t)st.st_size);
+        int client_write_ok =
+            send(clntsock, header, strlen(header), 0) >= 0;
+        size_t n;
+        char file_buffer[MAX_REQUEST_LEN];
+        while (client_write_ok &&
+               (n = fread(file_buffer, 1, sizeof(file_buffer), file)) > 0) {
+            if (send(clntsock, file_buffer, n, 0) < 0) {
+                client_write_ok = 0;
+            }
+        }
+        fclose(file);
+        snprintf(resp, sizeof(resp), "200 OK");
+        fprintf(stdout, "%s \"%s %s %s\" %s\n", inet_ntoa(clntaddr.sin_addr),
+            method, requestURI, httpVersion, resp);
+        fclose(fp);
+        continue;
     }
     close(servsock);
     close_backend(&backend_conn);
+    close(web_root_fd);
     return 0;
 }
